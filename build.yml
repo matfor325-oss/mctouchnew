@@ -1,0 +1,573 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/mcpe/touchpad app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MCTouch"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.mcpe.touchpad'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.mcpe.touchpad'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".TouchService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">MC Touch</string>
+              <string name="service_desc">يعرض أزرار تحكم فوق ماين كرافت وينفذ اللمسات نيابة عنك (ضرب، استخدام، انحناء).</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/mcpe/touchpad/TouchService.kt <<'EOF'
+          package com.mcpe.touchpad
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.TextView
+
+          class TouchService : AccessibilityService(), SharedPreferences.OnSharedPreferenceChangeListener {
+
+              private class Def(
+                  val id: String, val label: String, val marker: String, val color: Int,
+                  val bx: Float, val by: Float, val tx: Float, val ty: Float
+              )
+
+              private class Channel {
+                  var x = 0f
+                  var y = 0f
+                  var wanted = false
+                  var stroke: GestureDescription.StrokeDescription? = null
+              }
+
+              private val defs = listOf(
+                  Def("attack", "ضرب", "ض", 0xFFD32F2F.toInt(), 0.80f, 0.62f, 0.45f, 0.50f),
+                  Def("use", "استخدام", "س", 0xFF388E3C.toInt(), 0.90f, 0.42f, 0.55f, 0.50f),
+                  Def("sneak", "انحناء", "ن", 0xFF1976D2.toInt(), 0.10f, 0.40f, 0.93f, 0.82f)
+              )
+
+              private lateinit var wm: WindowManager
+              private lateinit var prefs: SharedPreferences
+              private val handler = Handler(Looper.getMainLooper())
+              private val views = ArrayList<View>()
+              private val channels = HashMap<String, Channel>()
+              private var inFlight = false
+              private var mcForeground = false
+              private var sneakOn = false
+              private var screenW = 1
+              private var screenH = 1
+              private var baseAlpha = 0.6f
+              private val seg = 60L
+
+              private val callback = object : AccessibilityService.GestureResultCallback() {
+                  override fun onCompleted(gestureDescription: GestureDescription?) {
+                      inFlight = false
+                      pump()
+                  }
+
+                  override fun onCancelled(gestureDescription: GestureDescription?) {
+                      inFlight = false
+                      for (c in channels.values) c.stroke = null
+                      if (channels.values.any { it.wanted }) handler.postDelayed({ pump() }, 40)
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
+                  prefs.registerOnSharedPreferenceChangeListener(this)
+                  refresh()
+              }
+
+              override fun onSharedPreferenceChanged(sp: SharedPreferences?, key: String?) {
+                  if (key != null && key.startsWith("pos_")) return
+                  handler.post { refresh() }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null) return
+                  if (event.packageName?.toString() == packageName) return
+                  val t = event.eventType
+                  if (t == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || t == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+                      val root = rootInActiveWindow ?: return
+                      val pkg = root.packageName?.toString()
+                      @Suppress("DEPRECATION")
+                      root.recycle()
+                      if (pkg == null) return
+                      val now = pkg == "com.mojang.minecraftpe"
+                      if (now != mcForeground) {
+                          mcForeground = now
+                          refresh()
+                      }
+                  }
+              }
+
+              override fun onInterrupt() {
+                  releaseAll()
+              }
+
+              override fun onDestroy() {
+                  try { prefs.unregisterOnSharedPreferenceChangeListener(this) } catch (e: Exception) {}
+                  clearViews()
+                  super.onDestroy()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun updateScreen() {
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      val b = wm.currentWindowMetrics.bounds
+                      screenW = b.width()
+                      screenH = b.height()
+                  } else {
+                      val m = DisplayMetrics()
+                      @Suppress("DEPRECATION")
+                      wm.defaultDisplay.getRealMetrics(m)
+                      screenW = m.widthPixels
+                      screenH = m.heightPixels
+                  }
+              }
+
+              private fun clearViews() {
+                  for (v in views) {
+                      try { wm.removeView(v) } catch (e: Exception) {}
+                  }
+                  views.clear()
+              }
+
+              private fun releaseAll() {
+                  sneakOn = false
+                  for (c in channels.values) c.wanted = false
+                  pump()
+              }
+
+              private fun refresh() {
+                  clearViews()
+                  releaseAll()
+                  if (!prefs.getBoolean("enabled", false)) return
+                  val edit = prefs.getBoolean("edit", false)
+                  if (!edit && prefs.getBoolean("only_mc", true) && !mcForeground) return
+                  updateScreen()
+                  val sizePx = dp(prefs.getInt("size", 70))
+                  baseAlpha = prefs.getInt("alpha", 60) / 100f
+
+                  for (d in defs) {
+                      val kbx = "pos_bx_${d.id}"
+                      val kby = "pos_by_${d.id}"
+                      val ktx = "pos_tx_${d.id}"
+                      val kty = "pos_ty_${d.id}"
+                      val btn = circle(d.label, d.color, baseAlpha, 12f)
+                      val lp = addOverlay(btn, sizePx, sizePx, prefs.getFloat(kbx, d.bx), prefs.getFloat(kby, d.by))
+                      if (edit) {
+                          enableDrag(btn, lp, sizePx, sizePx, kbx, kby)
+                          val msz = dp(36)
+                          val m = circle(d.marker, 0xFF000000.toInt(), 0.9f, 14f)
+                          val lp2 = addOverlay(m, msz, msz, prefs.getFloat(ktx, d.tx), prefs.getFloat(kty, d.ty))
+                          enableDrag(m, lp2, msz, msz, ktx, kty)
+                      } else {
+                          attachAction(btn, d)
+                      }
+                  }
+
+                  if (edit) {
+                      val done = TextView(this)
+                      done.text = "تم ✔ حفظ"
+                      done.gravity = Gravity.CENTER
+                      done.setTextColor(Color.WHITE)
+                      done.textSize = 15f
+                      done.setTypeface(null, Typeface.BOLD)
+                      val bg = GradientDrawable()
+                      bg.cornerRadius = dp(22).toFloat()
+                      bg.setColor(0xFF2E7D32.toInt())
+                      done.background = bg
+                      done.setOnClickListener { prefs.edit().putBoolean("edit", false).apply() }
+                      addOverlay(done, dp(120), dp(44), 0.5f, 0.10f)
+                  }
+              }
+
+              private fun circle(label: String, color: Int, alpha: Float, sp: Float): TextView {
+                  val tv = TextView(this)
+                  tv.text = label
+                  tv.gravity = Gravity.CENTER
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = sp
+                  tv.setTypeface(null, Typeface.BOLD)
+                  val bg = GradientDrawable()
+                  bg.shape = GradientDrawable.OVAL
+                  bg.setColor(color)
+                  bg.setStroke(dp(2), Color.WHITE)
+                  tv.background = bg
+                  tv.alpha = alpha
+                  return tv
+              }
+
+              private fun addOverlay(v: View, w: Int, h: Int, cx: Float, cy: Float): WindowManager.LayoutParams {
+                  val lp = WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_SPLIT_TOUCH,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = (cx * screenW - w / 2f).toInt()
+                  lp.y = (cy * screenH - h / 2f).toInt()
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  } else if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  wm.addView(v, lp)
+                  views.add(v)
+                  return lp
+              }
+
+              private fun enableDrag(v: View, lp: WindowManager.LayoutParams, w: Int, h: Int, kx: String, ky: String) {
+                  var sx = 0f
+                  var sy = 0f
+                  var ox = 0
+                  var oy = 0
+                  v.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = ox + (e.rawX - sx).toInt()
+                              lp.y = oy + (e.rawY - sy).toInt()
+                              try { wm.updateViewLayout(v, lp) } catch (ex: Exception) {}
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              val fx = ((lp.x + w / 2f) / screenW).coerceIn(0f, 1f)
+                              val fy = ((lp.y + h / 2f) / screenH).coerceIn(0f, 1f)
+                              prefs.edit().putFloat(kx, fx).putFloat(ky, fy).apply()
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun attachAction(v: TextView, d: Def) {
+                  v.setOnTouchListener { _, e ->
+                      val tx = prefs.getFloat("pos_tx_${d.id}", d.tx) * screenW
+                      val ty = prefs.getFloat("pos_ty_${d.id}", d.ty) * screenH
+                      if (d.id == "sneak") {
+                          if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                              sneakOn = !sneakOn
+                              v.alpha = if (sneakOn) 1f else baseAlpha
+                              v.text = if (sneakOn) "انحناء ✓" else d.label
+                              setChannel("sneak", sneakOn, tx, ty)
+                          }
+                      } else {
+                          when (e.actionMasked) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  v.alpha = 1f
+                                  setChannel(d.id, true, tx, ty)
+                              }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                  v.alpha = baseAlpha
+                                  setChannel(d.id, false, tx, ty)
+                              }
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun setChannel(id: String, wanted: Boolean, x: Float, y: Float) {
+                  val c = channels.getOrPut(id) { Channel() }
+                  c.x = x
+                  c.y = y
+                  c.wanted = wanted
+                  pump()
+              }
+
+              // يرسل لمسات مستمرة: كل قطعة قصيرة تكمل التي قبلها، ويمكن اجتماع عدة أزرار في إيماءة واحدة
+              private fun pump() {
+                  if (inFlight) return
+                  val b = GestureDescription.Builder()
+                  var n = 0
+                  val ending = ArrayList<Channel>()
+                  for (c in channels.values) {
+                      if (!c.wanted && c.stroke == null) continue
+                      val p = Path()
+                      p.moveTo(c.x, c.y)
+                      p.lineTo(c.x, c.y)
+                      val dur = if (c.wanted) seg else 10L
+                      val prev = c.stroke
+                      val s = if (prev == null) {
+                          GestureDescription.StrokeDescription(p, 0, dur, true)
+                      } else {
+                          prev.continueStroke(p, 0, dur, c.wanted)
+                      }
+                      b.addStroke(s)
+                      n++
+                      if (c.wanted) c.stroke = s else ending.add(c)
+                  }
+                  if (n == 0) return
+                  inFlight = true
+                  val ok = dispatchGesture(b.build(), callback, handler)
+                  if (!ok) {
+                      inFlight = false
+                      for (c in channels.values) c.stroke = null
+                      return
+                  }
+                  for (c in ending) c.stroke = null
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/mcpe/touchpad/MainActivity.kt <<'EOF'
+          package com.mcpe.touchpad
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var prefs: SharedPreferences
+              private lateinit var status: TextView
+              private val switches = LinkedHashMap<String, Switch>()
+              private val defaults = HashMap<String, Boolean>()
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(16), dp(16), dp(16), dp(24))
+
+                  val title = TextView(this)
+                  title.text = "MC Touch"
+                  title.textSize = 26f
+                  col.addView(title)
+
+                  status = TextView(this)
+                  status.textSize = 16f
+                  status.setPadding(0, dp(8), 0, dp(8))
+                  col.addView(status)
+
+                  val open = Button(this)
+                  open.text = "فتح إعدادات إمكانية الوصول"
+                  open.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  col.addView(open)
+
+                  addSwitch(col, "إظهار الأزرار", "enabled", false)
+                  addSwitch(col, "إظهارها داخل ماين كرافت فقط", "only_mc", true)
+                  addSwitch(col, "وضع التعديل (سحب الأزرار ونقاط اللمس)", "edit", false)
+                  addSeek(col, "حجم الأزرار", "size", 40, 110, 70)
+                  addSeek(col, "الشفافية %", "alpha", 20, 100, 60)
+
+                  val reset = Button(this)
+                  reset.text = "إعادة الأماكن الافتراضية"
+                  reset.setOnClickListener {
+                      val e = prefs.edit()
+                      for (k in prefs.all.keys) if (k.startsWith("pos_")) e.remove(k)
+                      e.putLong("tick", System.currentTimeMillis())
+                      e.apply()
+                  }
+                  col.addView(reset)
+
+                  val help = TextView(this)
+                  help.textSize = 14f
+                  help.setPadding(0, dp(16), 0, 0)
+                  help.text = "طريقة الاستخدام:\n" +
+                      "1) اضغط «فتح إعدادات إمكانية الوصول» وفعّل خدمة MC Touch.\n" +
+                      "   (إن كان الخيار رمادياً: معلومات التطبيق ← ⋮ ← السماح بالإعدادات المقيدة)\n" +
+                      "2) فعّل «إظهار الأزرار».\n" +
+                      "3) فعّل «وضع التعديل»، افتح ماين كرافت، واسحب الأزرار لأماكنك.\n" +
+                      "   الدوائر السوداء الصغيرة (ض، س، ن) هي نقاط اللمس التي ينفذها التطبيق.\n" +
+                      "   ضع دائرة (ن) فوق زر الانحناء الموجود داخل اللعبة، ثم اضغط «تم».\n" +
+                      "4) داخل اللعبة اجعل التحكم Classic (الكروس هير).\n\n" +
+                      "ضرب: اضغط مطولاً للكسر. استخدام: نقرة للوضع، ومطولة للأكل. انحناء: ضغطة تشغّل وضغطة تطفئ."
+                  col.addView(help)
+
+                  val sv = ScrollView(this)
+                  sv.addView(col)
+                  setContentView(sv)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  for ((k, s) in switches) s.isChecked = prefs.getBoolean(k, defaults[k] ?: false)
+                  val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                  val on = enabled != null && enabled.contains(packageName)
+                  status.text = if (on) "✔ الخدمة مفعّلة" else "✘ الخدمة غير مفعّلة"
+                  status.setTextColor(if (on) Color.parseColor("#2E7D32") else Color.parseColor("#C62828"))
+              }
+
+              private fun addSwitch(root: LinearLayout, text: String, key: String, def: Boolean) {
+                  val s = Switch(this)
+                  s.text = text
+                  s.setPadding(0, dp(10), 0, dp(10))
+                  s.isChecked = prefs.getBoolean(key, def)
+                  s.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(key, c).apply() }
+                  switches[key] = s
+                  defaults[key] = def
+                  root.addView(s)
+              }
+
+              private fun addSeek(root: LinearLayout, title: String, key: String, min: Int, max: Int, def: Int) {
+                  val label = TextView(this)
+                  val sb = SeekBar(this)
+                  val cur = prefs.getInt(key, def)
+                  sb.max = max - min
+                  sb.progress = cur - min
+                  label.text = "$title: $cur"
+                  label.setPadding(0, dp(10), 0, 0)
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                          label.text = "$title: ${p + min}"
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {
+                          prefs.edit().putInt(key, (s?.progress ?: 0) + min).apply()
+                      }
+                  })
+                  root.addView(label)
+                  root.addView(sb)
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MCTouch-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
